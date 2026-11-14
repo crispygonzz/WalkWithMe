@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Walk Map</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#ddd;font:13px monospace;overflow:hidden}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+canvas{background:#000;border:2px solid #777;touch-action:none}
+#s{text-align:center;padding:0 8px;min-height:2.6em}
+button{background:#111;color:#ddd;border:1px solid #777;padding:8px 12px;font:inherit}
+</style></head><body>
+<div id="s">Starting…</div>
+<canvas id="c"></canvas>
+<div><button id="re">New map here</button> <button id="lay">Layout: on</button></div>
+<script>
+// ---- settings ----
+const N = 10;          // map is N x N chunks
+const C = 40;          // chunk size in meters  (map = 400m x 400m)
+const REVEAL = 20;     // meters around you that get revealed
+const Z = 18;          // satellite zoom
+const HALF = N*C/2, M_LAT = 110540;
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d');
+let W = 0, s = 0;
+let st = null;               // {lat0,lon0}
+let explored = {};           // "cx,cy" -> reveal start time
+let base = null;             // offscreen layout canvas
+let tiles = [];              // {img,wx,wy}
+let me = null, showLayout = true, loadedLayout = false;
+
+const mLon = lat => 111320*Math.cos(lat*Math.PI/180);
+const toM = (lat,lon) => ({x:(lon-st.lon0)*mLon(st.lat0), y:(lat-st.lat0)*M_LAT});
+const toC = p => ({x:(p.x+HALF)*s, y:(HALF-p.y)*s});
+const world = (lat,lon) => { const n=256*2**Z, r=lat*Math.PI/180;
+  return {x:(lon+180)/360*n, y:(1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*n}; };
+
+function size(){ W = Math.floor(Math.min(innerWidth-8, innerHeight-110)); cv.width=cv.height=W; s=W/(N*C); if(st){buildBase(); } draw(); }
+addEventListener('resize', size);
+
+function setup(lat,lon){
+  st = {lat0:lat, lon0:lon}; explored = {};
+  localStorage.setItem('walkmap', JSON.stringify({st, explored}));
+  loadLayout(); loadTiles(); size();
+}
+
+// ---- layout (roads / paths / buildings) from OpenStreetMap ----
+let ways = [];
+async function loadLayout(){
+  loadedLayout = false; ways = [];
+  const dLat = HALF/M_LAT, dLon = HALF/mLon(st.lat0);
+  const bb = [st.lat0-dLat, st.lon0-dLon, st.lat0+dLat, st.lon0+dLon].join(',');
+  const q = `[out:json][timeout:25];(way["highway"](${bb});way["building"](${bb}););out geom;`;
+  for (const url of ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter']) {
+    try { const r = await fetch(url,{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+      const j = await r.json(); ways = j.elements||[]; loadedLayout = true; break; } catch(e){}
+  }
+  buildBase(); draw();
+}
+const PATHS = ['footway','path','pedestrian','cycleway','steps','track','bridleway','corridor'];
+function buildBase(){
+  base = document.createElement('canvas'); base.width=base.height=W; const g = base.getContext('2d');
+  g.fillStyle='#303030'; g.fillRect(0,0,W,W); g.lineCap=g.lineJoin='round';
+  const pts = w => w.geometry.map(p=>toC(toM(p.lat,p.lon)));
+  const path = a => { g.beginPath(); a.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y)); };
+  ways.filter(w=>w.tags&&w.tags.building&&w.geometry).forEach(w=>{ path(pts(w)); g.closePath(); g.fillStyle='#8c8c8c'; g.fill(); });
+  const hw = ways.filter(w=>w.tags&&w.tags.highway&&w.geometry);
+  hw.filter(w=>!PATHS.includes(w.tags.highway)).forEach(w=>{ path(pts(w)); g.strokeStyle='#fff'; g.lineWidth=Math.max(2,6*s); g.stroke(); });
+  hw.filter(w=>PATHS.includes(w.tags.highway)).forEach(w=>{ path(pts(w)); g.strokeStyle='#000'; g.lineWidth=Math.max(1.5,1.8*s); g.stroke(); });
+}
+
+// ---- satellite tiles (Esri World Imagery) ----
+function loadTiles(){
+  tiles = [];
+  const dLat = HALF/M_LAT, dLon = HALF/mLon(st.lat0);
+  const a = world(st.lat0+dLat, st.lon0-dLon), b = world(st.lat0-dLat, st.lon0+dLon);
+  for (let ty=Math.floor(a.y/256); ty<=Math.floor(b.y/256); ty++)
+    for (let tx=Math.floor(a.x/256); tx<=Math.floor(b.x/256); tx++) {
+      const img = new Image(); img.crossOrigin='anonymous';
+      img.onload = draw;
+      img.src = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${Z}/${ty}/${tx}`;
+      tiles.push({img, wx:tx*256, wy:ty*256});
+    }
+}
+
+// ---- drawing ----
+function draw(){
+  if(!W) return;
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,W);
+  if(!st){ return; }
+  if(showLayout && base) ctx.drawImage(base,0,0);
+  const dLat = HALF/M_LAT, dLon = HALF/mLon(st.lat0);
+  const nw = world(st.lat0+dLat, st.lon0-dLon), se = world(st.lat0-dLat, st.lon0+dLon);
+  const k = W/(se.x-nw.x), ky = W/(se.y-nw.y), cs = C*s, now = performance.now();
+  let animating = false;
+  for (const key in explored) {
+    const [cx,cy] = key.split(',').map(Number);
+    const a = Math.min(1, Math.max(0,(now-explored[key])/700));
+    if (a<1) animating = true;
+    if (a<=0) continue;
+    const x = cx*cs, y = cy*cs;
+    ctx.save(); ctx.beginPath(); ctx.rect(x,y,cs,cs); ctx.clip(); ctx.globalAlpha = a;
+    ctx.fillStyle='#000'; ctx.fillRect(x,y,cs,cs);
+    for (const t of tiles) if (t.img.complete && t.img.naturalWidth)
+      ctx.drawImage(t.img,(t.wx-nw.x)*k,(t.wy-nw.y)*ky,256*k+0.5,256*ky+0.5);
+    ctx.restore();
+  }
+  // faint chunk grid
+  ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1; ctx.beginPath();
+  for(let i=1;i<N;i++){ctx.moveTo(i*cs,0);ctx.lineTo(i*cs,W);ctx.moveTo(0,i*cs);ctx.lineTo(W,i*cs);} ctx.stroke();
+  // player
+  if (me) { const p = toC(toM(me.lat,me.lon));
+    if (p.x>=0&&p.y>=0&&p.x<=W&&p.y<=W) {
+      ctx.beginPath(); ctx.arc(p.x,p.y,7,0,7); ctx.fillStyle='#f22'; ctx.fill(); ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke(); } }
+  if (animating) requestAnimationFrame(draw);
+}
+
+// ---- tracking ----
+function reveal(lat,lon){
+  const p = toM(lat,lon); let n = 0;
+  for (let cx=0;cx<N;cx++) for (let cy=0;cy<N;cy++) {
+    const x0=cx*C-HALF, x1=x0+C, y1=HALF-cy*C, y0=y1-C;
+    const dx = Math.max(x0-p.x,0,p.x-x1), dy = Math.max(y0-p.y,0,p.y-y1);
+    if (dx*dx+dy*dy <= REVEAL*REVEAL && !explored[cx+','+cy]) { explored[cx+','+cy] = performance.now()+Math.random()*500; n++; }
+  }
+  if (n) localStorage.setItem('walkmap', JSON.stringify({st, explored:Object.fromEntries(Object.keys(explored).map(k=>[k,0]))}));
+}
+function onPos(pos){
+  me = {lat:pos.coords.latitude, lon:pos.coords.longitude};
+  if (!st) setup(me.lat, me.lon);
+  const p = toM(me.lat, me.lon), out = Math.abs(p.x)>HALF || Math.abs(p.y)>HALF;
+  reveal(me.lat, me.lon);
+  const cnt = Object.keys(explored).length;
+  $('s').textContent = out ? 'You are outside this map. Tap "New map here".'
+    : `Explored ${cnt}/${N*N} chunks · GPS ±${Math.round(pos.coords.accuracy)}m` + (loadedLayout?'':' · loading layout…');
+  draw();
+}
+function onErr(e){ $('s').textContent = 'Location error: '+e.message+'. Allow location access for this site (HTTPS required).'; }
+function start(){
+  if (!navigator.geolocation) return $('s').textContent='Geolocation not supported.';
+  navigator.geolocation.watchPosition(onPos,onErr,{enableHighAccuracy:true,maximumAge:2000,timeout:20000});
+}
+$('re').onclick = () => { if(me){ setup(me.lat,me.lon); onPos({coords:{latitude:me.lat,longitude:me.lon,accuracy:0}}); } };
+$('lay').onclick = () => { showLayout=!showLayout; $('lay').textContent='Layout: '+(showLayout?'on':'off'); draw(); };
+
+try { const saved = JSON.parse(localStorage.getItem('walkmap')||'null');
+  if (saved && saved.st) { st = saved.st; explored = saved.explored||{}; loadLayout(); loadTiles(); } } catch(e){}
+size(); start();
+</script></body></html>
