@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Walk Map</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#ddd;font:13px monospace;overflow:hidden}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+canvas{background:#000;border:2px solid #777;touch-action:none}
+#s{text-align:center;padding:0 8px;min-height:2.6em}
+button{background:#111;color:#ddd;border:1px solid #777;padding:8px 12px;font:inherit}
+</style></head><body>
+<div id="s">Starting…</div>
+<canvas id="c"></canvas>
+<div><button id="zo">−</button> <button id="zi">+</button> <button id="wh">Whole map</button> <button id="ce">Find me</button> <button id="lay">Layout: on</button> <button id="gb">Import GPX</button> <button id="re">New map</button><input id="gpx" type="file" accept=".gpx,.xml" hidden></div>
+<script>
+// ---- settings ----
+const N = 100;         // map is N x N chunks
+const C = 40;          // chunk size (m)  -> map = 4km x 4km
+const REVEAL = 20;     // meters revealed around you
+const Z = 18;          // satellite zoom
+const B = 500;         // layout download block size (m)
+const HALF = N*C/2, M_LAT = 110540, KEY = 'walkmap100';
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d');
+let W=0, s=0, vx=0, vy=0, follow=true, st=null, org=null, me=null, showLayout=true;
+let explored={}, ways=[], wayIds=new Set(), blocks={}, tiles={}, queue=[], busy=false, raf=false;
+
+const mLon = lat => 111320*Math.cos(lat*Math.PI/180);
+const toM = (lat,lon) => ({x:(lon-st.lon0)*mLon(st.lat0), y:(lat-st.lat0)*M_LAT});
+const toC = (x,y) => ({x:W/2+(x-vx)*s, y:W/2-(y-vy)*s});
+const world = (lat,lon) => { const n=256*2**Z, r=lat*Math.PI/180;
+  return {x:(lon+180)/360*n, y:(1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*n}; };
+const kmFn = () => 256*2**Z/(40075016.686*Math.cos(st.lat0*Math.PI/180));
+const redraw = () => { if(!raf){ raf=true; requestAnimationFrame(()=>{raf=false; draw();}); } };
+
+function size(){ W=Math.floor(Math.min(innerWidth-8, innerHeight-110)); cv.width=cv.height=W; if(!s) s=W/(N*C); redraw(); }
+addEventListener('resize', size);
+
+function init(lat,lon,ex){
+  st={lat0:lat,lon0:lon}; org=world(lat,lon); explored=ex||{}; ways=[]; wayIds=new Set(); blocks={}; tiles={}; queue=[];
+  vx=vy=0; follow=false; s=W/(N*C); save();
+}
+function save(){ localStorage.setItem(KEY, JSON.stringify({st, ex:Object.keys(explored)})); }
+
+// ---- layout from OpenStreetMap, downloaded in blocks near you ----
+function ensureBlocks(x,y,r=350){
+  const nb=HALF*2/B;
+  for(let bx=Math.floor((x-r+HALF)/B); bx<=Math.floor((x+r+HALF)/B); bx++)
+  for(let by=Math.floor((y-r+HALF)/B); by<=Math.floor((y+r+HALF)/B); by++){
+    if(bx<0||by<0||bx>=nb||by>=nb) continue;
+    const k=bx+','+by, b=blocks[k];
+    if(b && (b.ok || b.pending || Date.now()-b.t<30000)) continue;
+    blocks[k]={pending:true,t:Date.now()}; queue.push({k,bx,by});
+  }
+  queue.sort((a,b)=>Math.hypot(a.bx*B+B/2-HALF-x,a.by*B+B/2-HALF-y)-Math.hypot(b.bx*B+B/2-HALF-x,b.by*B+B/2-HALF-y));
+  pump();
+}
+let active=0;
+const db=new Promise(res=>{ try{ const q=indexedDB.open('walkmap-cache',1); q.onupgradeneeded=()=>q.result.createObjectStore('b');
+  q.onsuccess=()=>res(q.result); q.onerror=()=>res(null); }catch(e){res(null);} });
+const dbGet=async k=>{ const d=await db; if(!d) return null; return new Promise(r=>{ try{ const q=d.transaction('b').objectStore('b').get(k); q.onsuccess=()=>r(q.result||null); q.onerror=()=>r(null);}catch(e){r(null);} }); };
+const dbPut=async(k,v)=>{ const d=await db; if(d) try{ d.transaction('b','readwrite').objectStore('b').put(v,k); }catch(e){} };
+function addWays(list){
+  for(const w of list){ if(wayIds.has(w.id)) continue; wayIds.add(w.id);
+    const xs=w.pts.map(p=>p.x), ys=w.pts.map(p=>p.y);
+    ways.push({pts:w.pts,b:w.b,path:w.path,minx:Math.min(...xs),maxx:Math.max(...xs),miny:Math.min(...ys),maxy:Math.max(...ys)}); }
+}
+const FOOT=['footway','path','pedestrian','cycleway','steps','track','bridleway','corridor'];
+function pump(){ while(active<3&&queue.length){ active++; load(queue.shift()).catch(()=>{}).then(()=>{active--;redraw();pump();}); } }
+async function load({k,bx,by}){
+  const ck=st.lat0.toFixed(5)+','+st.lon0.toFixed(5)+':'+k;
+  const c=await dbGet(ck);
+  if(c){ addWays(c); blocks[k]={ok:true,t:Date.now()}; return; }
+  const x0=bx*B-HALF, y0=by*B-HALF;
+  const bb=[st.lat0+y0/M_LAT, st.lon0+x0/mLon(st.lat0), st.lat0+(y0+B)/M_LAT, st.lon0+(x0+B)/mLon(st.lat0)].join(',');
+  const q=`[out:json][timeout:25];(way["highway"](${bb});way["building"](${bb}););out geom qt;`;
+  for(const url of ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter']){
+    try{ const r=await fetch(url,{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+      const j=await r.json(), list=[];
+      for(const w of j.elements||[]){ if(!w.geometry||!w.tags) continue;
+        list.push({id:w.id, b:!!w.tags.building, path:FOOT.includes(w.tags.highway),
+          pts:w.geometry.map(p=>{const m=toM(p.lat,p.lon); return {x:Math.round(m.x*10)/10,y:Math.round(m.y*10)/10};})}); }
+      addWays(list); dbPut(ck,list); blocks[k]={ok:true,t:Date.now()}; return; }catch(e){}
+  }
+  blocks[k]={ok:false,t:Date.now()};
+}
+
+// ---- satellite tiles (Esri World Imagery), fetched only when needed ----
+function getTile(tx,ty){
+  const k=tx+','+ty; if(tiles[k]) return tiles[k];
+  const img=new Image(); img.onload=redraw;
+  img.src=`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${Z}/${ty}/${tx}`;
+  return tiles[k]=img;
+}
+
+// ---- drawing ----
+function draw(){
+  if(!W) return;
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,W);
+  if(!st) return;
+  const g=toC(-HALF,HALF); ctx.fillStyle='#303030'; ctx.fillRect(g.x,g.y,N*C*s,N*C*s);
+  const ext=W/2/s+20, vis=w=>w.maxx>vx-ext&&w.minx<vx+ext&&w.maxy>vy-ext&&w.miny<vy+ext;
+  if(showLayout){
+    ctx.lineCap=ctx.lineJoin='round';
+    const trace=w=>{ctx.beginPath(); w.pts.forEach((p,i)=>{const c=toC(p.x,p.y); i?ctx.lineTo(c.x,c.y):ctx.moveTo(c.x,c.y);});};
+    const vw=ways.filter(vis);
+    ctx.fillStyle='#8c8c8c'; vw.filter(w=>w.b).forEach(w=>{trace(w);ctx.closePath();ctx.fill();});
+    ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(1.5,6*s); vw.filter(w=>!w.b&&!w.path).forEach(w=>{trace(w);ctx.stroke();});
+    ctx.strokeStyle='#000'; ctx.lineWidth=Math.max(1,1.8*s); vw.filter(w=>!w.b&&w.path).forEach(w=>{trace(w);ctx.stroke();});
+  }
+  const km=kmFn(), now=performance.now(), cs=C*s; let anim=false;
+  for(const key in explored){
+    const [cx,cy]=key.split(',').map(Number), x0=cx*C-HALF, y1=HALF-cy*C;
+    const p=toC(x0,y1); if(p.x>W||p.y>W||p.x+cs<0||p.y+cs<0) continue;
+    const a=Math.min(1,Math.max(0,(now-explored[key])/700)); if(a<1) anim=true; if(a<=0) continue;
+    ctx.globalAlpha=a; ctx.fillStyle='#000'; ctx.fillRect(p.x,p.y,cs+.6,cs+.6);
+    const wx0=org.x+x0*km, wx1=org.x+(x0+C)*km, wy0=org.y-y1*km, wy1=org.y-(y1-C)*km;
+    for(let ty=Math.floor(wy0/256); ty<=Math.floor((wy1-1e-6)/256); ty++)
+    for(let tx=Math.floor(wx0/256); tx<=Math.floor((wx1-1e-6)/256); tx++){
+      const img=getTile(tx,ty); if(!img.complete||!img.naturalWidth) continue;
+      const ix0=Math.max(wx0,tx*256), ix1=Math.min(wx1,tx*256+256), iy0=Math.max(wy0,ty*256), iy1=Math.min(wy1,ty*256+256);
+      if(ix1<=ix0||iy1<=iy0) continue;
+      const d=toC((ix0-org.x)/km,(org.y-iy0)/km);
+      ctx.drawImage(img,ix0-tx*256,iy0-ty*256,ix1-ix0,iy1-iy0,d.x,d.y,(ix1-ix0)/km*s+.6,(iy1-iy0)/km*s+.6);
+    }
+    ctx.globalAlpha=1;
+  }
+  if(cs>=8){ ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1; ctx.beginPath();
+    for(let i=0;i<=N;i++){ const a=toC(i*C-HALF,0).x, b=toC(0,HALF-i*C).y;
+      ctx.moveTo(a,0);ctx.lineTo(a,W);ctx.moveTo(0,b);ctx.lineTo(W,b);} ctx.stroke(); }
+  if(me){ const m=toM(me.lat,me.lon), p=toC(m.x,m.y);
+    ctx.beginPath(); ctx.arc(p.x,p.y,7,0,7); ctx.fillStyle='#f22'; ctx.fill(); ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke(); }
+  if(anim) redraw();
+}
+
+// ---- tracking ----
+function reveal(x,y,quiet){
+  let n=0;
+  for(let cx=Math.max(0,Math.floor((x-REVEAL+HALF)/C)); cx<=Math.min(N-1,Math.floor((x+REVEAL+HALF)/C)); cx++)
+  for(let cy=Math.max(0,Math.floor((HALF-y-REVEAL)/C)); cy<=Math.min(N-1,Math.floor((HALF-y+REVEAL)/C)); cy++){
+    const x0=cx*C-HALF, y1=HALF-cy*C, y0=y1-C;
+    const dx=Math.max(x0-x,0,x-(x0+C)), dy=Math.max(y0-y,0,y-y1);
+    if(dx*dx+dy*dy<=REVEAL*REVEAL && !(cx+','+cy in explored)){ explored[cx+','+cy]=performance.now()+Math.random()*500; n++; }
+  }
+  if(n&&!quiet) save();
+}
+function onPos(pos){
+  me={lat:pos.coords.latitude,lon:pos.coords.longitude};
+  if(!st) init(me.lat,me.lon);
+  const p=toM(me.lat,me.lon), out=Math.abs(p.x)>HALF||Math.abs(p.y)>HALF;
+  if(!out){ reveal(p.x,p.y); ensureBlocks(p.x,p.y,3000); }
+  if(follow){ vx=p.x; vy=p.y; }
+  $('s').textContent = out ? 'You are outside this map. Tap "New map".'
+    : `Explored ${Object.keys(explored).length}/${N*N} chunks · GPS ±${Math.round(pos.coords.accuracy)}m` + (queue.length||active?' · loading layout…':'');
+  redraw();
+}
+function onErr(e){ $('s').textContent='Location error: '+e.message+'. Allow location for this site in Safari/Chrome settings.'; }
+
+// ---- controls ----
+const ptrs=new Map(); let lastD=0;
+function zoomAt(cx,cy,f){
+  const r=cv.getBoundingClientRect(), px=(cx-r.left)*W/r.width, py=(cy-r.top)*W/r.height;
+  const mx=vx+(px-W/2)/s, my=vy-(py-W/2)/s;
+  s=Math.min(W/100,Math.max(W/4000,s*f));
+  vx=mx-(px-W/2)/s; vy=my+(py-W/2)/s; follow=false; redraw();
+}
+const two=()=>{ const [a,b]=[...ptrs.values()]; return {d:Math.hypot(a.x-b.x,a.y-b.y)||1, x:(a.x+b.x)/2, y:(a.y+b.y)/2}; };
+cv.onpointerdown=e=>{ cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY}); if(ptrs.size==2) lastD=two().d; };
+cv.onpointermove=e=>{
+  const o=ptrs.get(e.pointerId); if(!o||!st) return;
+  if(ptrs.size==1){ vx-=(e.clientX-o.x)/s; vy+=(e.clientY-o.y)/s; follow=false; o.x=e.clientX; o.y=e.clientY; redraw(); }
+  else if(ptrs.size==2){
+    const before=two(); o.x=e.clientX; o.y=e.clientY; const now=two();
+    vx-=(now.x-before.x)/s; vy+=(now.y-before.y)/s;
+    zoomAt(now.x,now.y,now.d/lastD); lastD=now.d;
+  }
+};
+const up=e=>{ ptrs.delete(e.pointerId); if(ptrs.size==2) lastD=two().d; if(!ptrs.size&&st) ensureBlocks(vx,vy); };
+cv.onpointerup=up; cv.onpointercancel=up;
+['gesturestart','gesturechange'].forEach(t=>document.addEventListener(t,e=>e.preventDefault()));
+cv.addEventListener('wheel',e=>{ e.preventDefault(); if(st) zoomAt(e.clientX,e.clientY,Math.exp(-e.deltaY*0.0015)); },{passive:false});
+const zoom=f=>{ s=Math.min(W/100,Math.max(W/4000,s*f)); redraw(); };
+$('zi').onclick=()=>zoom(1.6); $('zo').onclick=()=>zoom(1/1.6);
+$('wh').onclick=()=>{ follow=false; vx=vy=0; s=W/(N*C); redraw(); };
+$('ce').onclick=()=>{ follow=true; s=W/400; if(me){const p=toM(me.lat,me.lon); vx=p.x; vy=p.y;} redraw(); };
+$('lay').onclick=()=>{ showLayout=!showLayout; $('lay').textContent='Layout: '+(showLayout?'on':'off'); redraw(); };
+$('re').onclick=()=>{ if(me&&confirm('Start a new map here? Current progress will be erased.')){ init(me.lat,me.lon); onPos({coords:{latitude:me.lat,longitude:me.lon,accuracy:0}}); } };
+
+
+// ---- keep screen awake, catch up on return, import GPX ----
+let wl=null;
+async function keepAwake(){ try{ if('wakeLock' in navigator && !wl){ wl=await navigator.wakeLock.request('screen'); wl.onrelease=()=>{wl=null;}; } }catch(e){} }
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'){ keepAwake();
+  if(navigator.geolocation) navigator.geolocation.getCurrentPosition(onPos,()=>{},{enableHighAccuracy:true,timeout:15000}); } });
+cv.addEventListener('pointerdown',keepAwake,{once:true}); keepAwake();
+$('gb').onclick=()=>$('gpx').click();
+$('gpx').onchange=async e=>{
+  const f=e.target.files[0]; e.target.value=''; if(!f) return;
+  const d=new DOMParser().parseFromString(await f.text(),'text/xml');
+  const pts=[...d.querySelectorAll('trkpt,rtept')].map(n=>({lat:+n.getAttribute('lat'),lon:+n.getAttribute('lon')})).filter(p=>isFinite(p.lat)&&isFinite(p.lon));
+  if(!pts.length){ $('s').textContent='No track points found in that file.'; return; }
+  if(!st) init(pts[0].lat,pts[0].lon);
+  const before=Object.keys(explored).length, ok=(x,y)=>Math.abs(x)<=HALF&&Math.abs(y)<=HALF; let prev=null;
+  for(const q of pts){ const m=toM(q.lat,q.lon);
+    if(prev){ const dist=Math.hypot(m.x-prev.x,m.y-prev.y), n=dist<=300?Math.ceil(dist/10):1;
+      for(let i=1;i<=n;i++){ const x=prev.x+(m.x-prev.x)*i/n, y=prev.y+(m.y-prev.y)*i/n; if(ok(x,y)) reveal(x,y,true); } }
+    else if(ok(m.x,m.y)) reveal(m.x,m.y,true);
+    prev=m; }
+  save(); ensureBlocks(0,0,3000); redraw();
+  $('s').textContent=`Imported ${pts.length} points · ${Object.keys(explored).length-before} new chunks revealed.`;
+};
+
+try{ const sv=JSON.parse(localStorage.getItem(KEY)||'null');
+  if(sv&&sv.st){ size(); init(sv.st.lat0,sv.st.lon0,Object.fromEntries(sv.ex.map(k=>[k,0]))); } }catch(e){}
+size();
+if(!navigator.geolocation) $('s').textContent='Geolocation not supported.';
+else navigator.geolocation.watchPosition(onPos,onErr,{enableHighAccuracy:true,maximumAge:2000,timeout:20000});
+</script></body></html>
